@@ -20,11 +20,13 @@
 #include <err.h>
 #include <fts.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sysexits.h>
 #include <unistd.h>
+#include <sys/acl.h>
 
 #define ZERO_STRUCT(x) memset_s((char *)&(x), sizeof(x), 0, sizeof(x))
 
@@ -32,6 +34,7 @@ struct scanlnk_info {
 	char	*path;
 	int	action;
 	dev_t root_dev;
+	uint	acl_cnt;
 };
 
 struct enum_list {
@@ -39,11 +42,12 @@ struct enum_list {
 	const char *name;
 };
 
-enum si_action {SI_FULL, SI_QUICK};
+enum si_action {SI_FULL, SI_QUICK, SI_ACL};
 
 static const struct enum_list si_action[] = {
 	{SI_FULL, "full"},	/* Full scan for symlinks */
 	{SI_QUICK, "quick"},	/* Quick symlink scan */
+	{SI_ACL, "acl"},	/* Quick symlink scan */
 	{ -1, NULL}
 };
 
@@ -78,6 +82,28 @@ setarg(char **pptr, const char *src)
 
 	*pptr = ptr;
 }
+
+static void
+conv_str_int(const char *str, uint *valp)
+{
+	char *end = NULL;
+	long lval;
+
+	lval = strtol(str, &end, 10);
+	if (end == NULL || *end != '\0' || end == str)
+		errx(EX_DATAERR, "%s: Failed to convert to size. "
+		     "sizelimit must be expressed as "
+		     "integer.\n", str);
+
+	if ((lval == LONG_MIN || lval == LONG_MAX) && errno == ERANGE)
+		errx(EX_DATAERR, "%s: invalid size for sizelimit.", str);
+
+	if (lval < 0 || ((lval & ~UINT32_MAX) != 0))
+		errx(EX_DATAERR, "%s: invalid size for sizelimit.", str);
+
+	*valp = (uint)lval;
+}
+
 
 static void
 free_scanlnk_info(struct scanlnk_info *si)
@@ -139,19 +165,46 @@ symlink_check(struct scanlnk_info *si, FTSENT *fts_entry)
 }
 
 static int
+acl_check(struct scanlnk_info *si, FTSENT *fts_entry)
+{
+	acl_t theacl = NULL;
+	char *path = fts_entry->fts_path;
+
+	theacl = acl_get_file(path, ACL_TYPE_NFS4);
+	if (theacl == NULL) {
+		warnx("%s: acl_get_file() failed: %s\n",
+		      path, strerror(errno));
+		return -1;
+	}
+
+	uint acl_cnt = theacl->ats_acl.acl_cnt;
+	uint max_cnt = theacl->ats_acl.acl_maxcnt;
+
+	if (acl_cnt > si->acl_cnt) {
+		fprintf(stderr, "%s\t|acl count exceeded|%d|%d\n",
+			 path, acl_cnt, max_cnt);
+	}
+	acl_free(theacl);
+	return 0;
+}
+
+static int
 scan_links(struct scanlnk_info *si)
 {
 	int rval, options;
+	int (*fn)(struct scanlnk_info *c, FTSENT *ftsent);
 	FTS *tree = NULL;
 	FTSENT *entry = NULL;
 	rval = options = 0;
 	char *paths[2];
-	bool has_symlink;
+	bool has_symlink = false;
 
 	if (si == NULL) {
 		return EINVAL;		
 	}
 	
+	fn = si->action == SI_ACL ? acl_check : symlink_check;
+
 	paths[0] = si->path;
 	paths[1] = NULL;
 	tree = fts_open(paths, options, fts_compare);
@@ -161,11 +214,11 @@ scan_links(struct scanlnk_info *si)
 	for (rval = 0; (entry = fts_read(tree)) != NULL;) {
 		switch (entry->fts_info) {
 			case FTS_SL:
-				rval = symlink_check(si, entry);
+				rval = fn(si, entry);
 				if (rval == ELOOP) {
 					has_symlink = true;
 				}
-				if (si->action != SI_QUICK) {
+				if (si->action == SI_FULL) {
 					rval = 0;
 				}
 				break;
@@ -196,7 +249,7 @@ main(int argc, char **argv)
 	struct stat st;
 	si = calloc(1, sizeof(struct scanlnk_info));
 	ZERO_STRUCT(st);
-	while ((ch = getopt(argc, argv, "a:p:")) != -1) {
+	while ((ch = getopt(argc, argv, "a:p:n:")) != -1) {
 		switch(ch) {
 		case 'a': {
 			int action = get_enum(optarg, si_action);
@@ -206,9 +259,14 @@ main(int argc, char **argv)
 			si->action |= action;
 			break;
 		}
-		case 'p':
+		case 'p': {
 			setarg(&si->path, optarg);
 			break;
+		}
+		case 'n': {
+			conv_str_int(optarg, &si->acl_cnt);
+			break;
+		}
 		case '?':
 		default:
 			usage(argv[0]);
